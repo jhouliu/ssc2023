@@ -1,0 +1,508 @@
+---
+title: "SSC 2023 - High Performance R"
+subtitle: "Session 2"
+author: "Jason Hou-Liu"
+output: pdf_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+pkgs = c("Rcpp", "RcppArmadillo", "Rfast", "Rfast2", "pbapply", "profvis", "bench")
+success = suppressMessages(sapply(pkgs, require, character.only = TRUE, quietly = TRUE))
+if (all(success)) message("Successfully loaded all packages!") else stop("Failed to load ", paste0(pkgs[!success], collapse = ", "))
+```
+
+# Welcome!
+
+This is the sidecar file for the third session of High Performance R at SSC 2023 in Ottawa. You will find examples and code here to run during and between presentations. This document is designed for interactive usage, but can also be knitted to whichever format you like. You do not need to run any previous Rmd documents, except to ensure all packages are installed.
+
+# pbapply package
+
+```{r}
+# Generate 1000 replicates of the iris dataset
+input = replicate(1000, iris)
+
+# Using regular lapply
+output = lapply(input, function(x) eigen(cov(iris[-5])))
+
+# Using pbapply with a progress bar
+output = pblapply(input, function(x) eigen(cov(iris[-5])))
+```
+
+# parallel package
+
+Check the number of cores:
+```{r}
+library(parallel)
+
+detectCores()
+```
+
+For safety reasons, we usually use 1 less than the value returned here. This prevents us from using so much CPU that the system stops responding.
+
+Start the cluster:
+```{r}
+cl = makeCluster(min(detectCores() - 1, 120))
+```
+
+Stop the cluster:
+```{r}
+stopCluster(cl)
+```
+
+Restart the cluster:
+```{r}
+try(stopCluster(cl)) 
+cl = makeCluster(min(detectCores() - 1, 120))
+```
+
+## Using pbapply package with a cluster
+
+```{r}
+# Generate 10000 replicates of the iris dataset
+input = replicate(10000, iris)
+
+# Using pbapply with a progress bar
+output = pblapply(input, function(x) eigen(cov(iris[-5])))
+
+# Using pbapply with a progress bar, and a cluster
+output = pblapply(input, 
+                  function(x) eigen(cov(iris[-5])),
+                  cl = cl)
+```
+
+## Leave-One-Out Cross-Validation on Logistic Regression
+
+Clusters can't use objects from the global environment without extra work:
+```{r}
+# Large amounts of logistic regression data 
+set.seed(1)
+n = 1e5
+d = 10
+true.beta = rnorm(d)
+X = cbind(1, matrix(rnorm(n * (d - 1)), n, d - 1))
+p = as.numeric(plogis(X %*% true.beta))
+y = runif(n) <= p
+
+# We'll only check LOOCV for the first 100 to save time
+input = 1:100 # index to leave-out
+
+# Using pbapply with a progress bar
+output = pblapply(input,
+                  function(i) glm.fit(X[-i, ], y[-i], family = binomial()),
+                  cl = NULL)
+
+# Using pbapply with a progress bar, and a cluster
+output = try(pblapply(input,
+                      function(i) glm.fit(X[-i, ], y[-i], family = binomial()),
+                      cl = cl))
+```
+
+Well, `X` is clearly here:
+```{r}
+head(X)
+```
+
+But the clusters don't have this data! Export `X` and `y` and try again:
+```{r}
+clusterExport(cl = cl, c("X", "y"))
+
+# You can even remove X and y from the master R process
+rm(X, y)
+
+# This should run now:
+output = pblapply(input,
+                  function(i) glm.fit(X[-i, ], y[-i], family = binomial()),
+                  cl = cl)
+```
+
+The returned result of `pblapply`, like `lapply`, is a list:
+```{r}
+str(output[[1]], 1)
+coef.matrix = sapply(output, function(x) x$coefficients)
+hist(coef.matrix[1,])
+```
+## Functions?
+
+What if we wanted to use our own logistic regression code instead of `glm.fit`?
+
+```{r}
+logistic.irls.4 = function(X, y, beta = rep(0, ncol(X)), iters) {
+  for (i in 1:iters) {
+    p = as.numeric((tanh(X %*% beta / 2) + 1) / 2)
+    hessian = crossprod(X * sqrt(p * (1 - p)))
+    gradient = crossprod(X, y - p)
+    beta = beta + solve(hessian, gradient)
+  }
+  return(beta)
+}
+
+clusterExport(cl = cl, "logistic.irls.4")
+
+output = pblapply(input,
+                  function(i) logistic.irls.4(X[-i, ], y[-i], iters = 10),
+                  cl = cl)
+```
+
+## Loading Libraries in a Cluster
+
+What if we needed a library like Rfast
+
+```{r}
+# spdinv comes from the Rfast package
+logistic.irls.5 = function(X, y, beta = rep(0, ncol(X)), iters) {
+  for (i in 1:iters) {
+    p = as.numeric((tanh(X %*% beta / 2) + 1) / 2)
+    hessian = crossprod(X * sqrt(p * (1 - p)))
+    gradient = crossprod(X, y - p)
+    beta = beta + spdinv(hessian) %*% gradient
+  }
+  return(beta)
+}
+
+clusterExport(cl = cl, "logistic.irls.5")
+
+output = try(pblapply(input,
+                      function(i) logistic.irls.5(X[-i, ], y[-i], iters = 10),
+                      cl = cl))
+```
+
+```{r}
+clusterEvalQ(cl = cl, {
+  # Any code you want to run on each R worker
+  library(Rfast)
+})
+
+output = pblapply(input,
+                  function(i) logistic.irls.5(X[-i, ], y[-i], iters = 10),
+                  cl = cl)
+```
+
+Be careful loading large datasets; you might accidentally return them to the
+main R process with an implicit return:
+
+```{r}
+clusterEvalQ(cl = cl, {
+  # Pretend we are reading iris in from csv
+  iris = iris # Returns iris by default
+})
+```
+
+```{r}
+clusterEvalQ(cl = cl, {
+  iris = iris
+  return(NA) # Avoid retrieving the data by returning a dummy value
+})
+```
+
+## Revisit: Amdahl's Law
+
+Dispatch and collection time; by making the matrix considerably larger, we can 
+watch this happen in real-time. Keep an eye on your Task Manager. These chunks 
+have `eval = FALSE` to prevent them from being run when knitting:
+```{r, eval = FALSE}
+# Very large amounts of logistic regression data 
+set.seed(1)
+n = 1e6
+d = 10
+true.beta = rnorm(d)
+X2 = cbind(1, matrix(rnorm(n * (d - 1)), n, d - 1))
+p = as.numeric(plogis(X %*% true.beta))
+y2 = runif(n) <= p
+
+format(object.size(X), "KiB")
+```
+
+```{r, eval = FALSE}
+# Send the bigger X2 and y2 to the cluster
+# You can watch the memory increase on Rscript sequentially
+clusterExport(cl = cl, c("X2", "y2"))
+
+# Run on the cluster
+# Keep an eye on CPU, watch it cycle
+input = 1:50
+output = pblapply(input,
+                  function(i) glm.fit(X2[-i, ], y2[-i], family = binomial()),
+                  cl = cl)
+```
+
+```{r, eval = FALSE}
+# Turn on load balancing and reduce # of progress updates to 1 (at completion)
+pboptions(use_lb = TRUE, nout = 1)
+output = pblapply(input,
+                  function(i) glm.fit(X2[-i, ], y2[-i], family = binomial()),
+                  cl = cl)
+```
+
+Notice how the progress bar doesn't update until the end, but much less CPU
+usage cycling was happening? Total elapsed time should have been shorter too.
+
+# Remote HPC Usage
+
+```{r, eval = FALSE}
+try(stopCluster(cl)) 
+cl = makeCluster(min(detectCores() - 1, 120))
+invisible(clusterEvalQ(cl = cl, {library(Rfast)}))
+
+set.seed(1)
+n = 1e5
+d = 10
+true.beta = rnorm(d)
+X = cbind(1, matrix(rnorm(n * (d - 1)), n, d - 1))
+p = as.numeric(plogis(X %*% true.beta))
+y = runif(n) <= p
+
+input = 1:100 
+
+logistic.irls.5 = function(X, y, beta = rep(0, ncol(X)), iters) {
+  for (i in 1:iters) {
+    p = as.numeric((tanh(X %*% beta / 2) + 1) / 2)
+    hessian = crossprod(X * sqrt(p * (1 - p)))
+    gradient = crossprod(X, y - p)
+    beta = beta + spdinv(hessian) %*% gradient
+  }
+  return(beta)
+}
+
+output = pblapply(input,
+                  function(i) logistic.irls.5(X[-i, ], y[-i], iters = 10),
+                  cl = cl)
+
+save(X, y, output, file = "~/my output.rdata")
+```
+
+
+# Simulation Design
+
+## Build a Design Matrix
+
+Suppose we want to investigate the effect on logistic regression for different
+number of observations $n$ and different dimensions $d$:
+```{r}
+library(tidyr)
+
+pars = crossing(
+  n = c(100, 1000, 10000),
+  d = c(10, 20, 30)
+)
+```
+
+If we want ten replications:
+```{r}
+pars = crossing(
+  n = c(100, 1000, 10000),
+  d = c(10, 20, 30),
+  rep = 1:10
+)
+```
+
+Different starting values:
+```{r}
+pars = crossing(
+  n = c(100, 1000, 10000),
+  d = c(10, 20, 30),
+  rep = 1:10,
+  start = list(
+    zeros = function(x) rep(0, x),
+    alternating = function(x) rep(c(1,-1), length.out = x),
+    random = function(x) rnorm(x)
+  )
+)
+```
+
+
+## Using the Design Matrix
+
+```{r}
+clusterExport(cl = cl, "pars")
+
+output = pblapply(1:nrow(pars),
+                  function(i) {
+                    par = pars[i,]
+                    n = par$n
+                    d = par$d
+                    start.fn = par$start[[1]] # this is a list-column
+                    
+                    true.beta = rnorm(d)
+                    X = cbind(1, matrix(rnorm(n * (d - 1)), n, d - 1))
+                    p = as.numeric(plogis(X %*% true.beta))
+                    y = runif(n) <= p
+                    
+                    start.beta = start.fn(d)
+                    fit = glm.fit(X, y, family = binomial())
+                    
+                    return(list(
+                      fit.beta = fit$coefficients,
+                      true.beta = true.beta
+                    ))
+                  },
+                  cl = cl)
+```
+
+We can glue the resulting output to the pars as a list-column too!
+```{r}
+par.out = pars
+par.out$output = output
+head(par.out)
+```
+
+Process the result using dplyr
+```{r}
+library(dplyr)
+MSE = function(x, y) mean((x - y)^2)
+
+processed = par.out %>% 
+  mutate(start.fn.name = names(start)) %>% # Pull the function names out
+  rowwise() %>% # Useful for accessing list-column elements of output
+  mutate(MSE = MSE(output$fit.beta, output$true.beta))
+
+library(ggplot2)
+processed %>% 
+  ggplot(aes(x = factor(n), fill = factor(d), y = MSE)) + 
+  geom_boxplot() + 
+  scale_y_log10() + 
+  facet_grid( ~ start.fn.name)
+```
+
+# Tips and Tricks
+
+## Reproducibility
+
+You can generate a seed for each row of `pars`, and use it inside the loop.
+This makes your parallel code reproducible, which is a great plus:
+```{r}
+set.seed(123456)
+pars$seed = floor(runif(nrow(pars), 1, 10000000))
+clusterExport(cl = cl, "pars")
+
+output = pblapply(1:nrow(pars),
+                  function(i) {
+                    par = pars[i,]
+                    n = par$n
+                    d = par$d
+                    start.fn = par$start[[1]]
+                    
+                    # # # # # # # # # #
+                    set.seed(par$seed) # Set the seed!
+                    # # # # # # # # # #
+                    
+                    true.beta = rnorm(d)
+                    X = cbind(1, matrix(rnorm(n * (d - 1)), n, d - 1))
+                    p = as.numeric(plogis(X %*% true.beta))
+                    y = runif(n) <= p
+                    
+                    start.beta = start.fn(d)
+                    fit = glm.fit(X, y, family = binomial())
+                    
+                    return(list(
+                      fit.beta = fit$coefficients,
+                      true.beta = true.beta
+                    ))
+                  },
+                  cl = cl)
+
+output[[1]]$fit.beta
+# You should get this every time:
+# -2.1524189  0.3987488 -0.7862714  0.6270051 -1.1330437 -0.1184664 -0.5177202  1.9535392 -0.1760002 -0.0997638
+```
+
+## Error Handling
+
+If something goes wrong in your code inside `pblapply`, bad things happen:
+```{r}
+# 10 invertible matrices (should be) and one near-singular one
+input = c(lapply(1:10, function(seed) matrnorm(2, 2, seed)), list(diag(c(1,1e-100))))
+output = try(pblapply(input, 
+                      function(x) {
+                        invx = solve(x)
+                        return(invx)
+                      },
+                      cl = cl))
+```
+
+All the prior successful results are lost! Make sure to handle errors at least
+using `tryCatch`:
+```{r}
+output = pblapply(input, 
+                  function(x) { 
+                    tryCatch({
+                      invx = solve(x)
+                      return(invx)
+                    },
+                    error = function(e) {
+                      return(list(input = x,
+                                  error = e))
+                    })
+                  })
+
+# Detect errors
+iserror = sapply(output, function(x) "error" %in% names(x))
+which(iserror)
+
+print(output[[10]])
+print(output[[11]])
+```
+If you are using a design matrix, returning the `par` row will be helpful
+for identifying which case failed. Since your code is in principle reproducible,
+you can re-run the exact configuration locally for more debugging tools.
+
+## Unattended Saving
+
+If you want to auto-save the results when pblapply finishes, use a
+`save.image` command to preserve everything for future use:
+```{r}
+filename = format(Sys.time(), "%Y-%m-%d %Hh%Mm%Ss USEFUL NAME HERE.rdata")
+print(filename)
+#save.image(file = filename)
+```
+Keeping track of the time and date when something completes can be helpful if
+you ever need to revisit a saved state.
+
+# OpenBLAS
+
+The following code should be run on the SSC Workshop cluster:
+```{r}
+library(RhpcBLASctl)
+omp_get_max_threads()   # Check how many cores can be used
+omp_set_num_threads(1)  # Restrict it to 1
+omp_get_max_threads()   # Double-check
+
+set.seed(1)
+X = rWishart(1, 5e3, diag(5e3))[,,1]
+system.time(eigen(X))
+
+omp_set_num_threads(4)  # Allow 4 cores
+system.time(eigen(X))
+```
+
+```{r}
+library(parallel)
+library(pbapply)
+
+set.seed(1)
+X2 = rWishart(1, 1e3, diag(1e3))[,,1]
+
+try(stopCluster(cl))
+cl = makeCluster(16)
+invisible(clusterEvalQ(cl = cl, {
+  library(RhpcBLASctl)
+  omp_set_num_threads(8)
+  return(NA)
+}))
+clusterExport(cl = cl, "X2")
+
+# Try this with and without cl
+output = pblapply(1:16, function(i) eigen(X2), cl = NULL)
+output = pblapply(1:16, function(i) eigen(X2), cl = cl)
+```
+
+What if we didn't have a conflict:
+```{r}
+invisible(clusterEvalQ(cl = cl, {
+  omp_set_num_threads(1)
+  return(NA)
+}))
+output = pblapply(1:16, function(i) eigen(X2), cl = cl)
+```

@@ -1,0 +1,466 @@
+---
+title: "SSC 2023 - High Performance R"
+subtitle: "Session 2"
+author: "Jason Hou-Liu"
+output: pdf_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+pkgs = c("Rcpp", "RcppArmadillo", "Rfast", "Rfast2", "pbapply", "profvis", "bench")
+success = suppressMessages(sapply(pkgs, require, character.only = TRUE, quietly = TRUE))
+if (all(success)) message("Successfully loaded all packages!") else stop("Failed to load ", paste0(pkgs[!success], collapse = ", "))
+```
+
+# Welcome!
+
+This is the sidecar file for the second session of High Performance R at SSC 2023 in Ottawa. You will find examples and code here to run during and between presentations. This document is designed for interactive usage, but can also be knitted to whichever format you like. You do not need to run any previous Rmd documents, except to ensure all packages are installed.
+
+# What is C++
+
+C++ is a compiled language, which can be very fast. However, it can also crash your R session if you're not careful!
+```{r}
+# This is the same test function from Session 1
+cppFunction("
+  arma::mat arma_crossprod(const arma::mat & X, const arma::mat & Y) {
+    arma::mat result = X.t() * Y;
+    return result;
+  }
+", depends = "RcppArmadillo")
+
+X = Y = as.matrix(iris[-5])
+crossprod(X, Y)
+arma_crossprod(X, Y)
+```
+
+```{r}
+# This function omits the return statement.
+# Unlike R, it will not automatically return the last value.
+cppFunction("
+  arma::mat arma_crossprod_bad(const arma::mat & X, const arma::mat & Y) {
+    arma::mat result = X.t() * Y;
+  }
+", depends = "RcppArmadillo")
+
+# This will crash your R session!
+# arma_crossprod_bad(X, Y)
+```
+
+
+# Rfast/Rfast2
+
+For a complete function listing, check out their respective reference manuals:
+https://cran.r-project.org/web/packages/Rfast/Rfast.pdf and 
+https://cran.r-project.org/web/packages/Rfast2/Rfast2.pdf
+
+
+## Some examples:
+
+### Converting a (numeric/factor) data frame to a matrix
+```{r}
+bench::mark(
+  as.matrix(iris), 
+  data.frame.to_matrix(iris), 
+  check = FALSE
+)
+```
+
+### Sampling integers uniformly:
+```{r}
+# Notice that you can't set the probability in Sample.int!
+bench::mark(
+  sample.int(1e6, 1e5), 
+  Sample.int(1e6, 1e5), 
+  check = FALSE
+)
+```
+
+### Parallel maxima:
+```{r}
+set.seed(2)
+a = rnorm(1e7)
+b = rnorm(1e7)
+```
+
+```{r}
+bench::mark(
+  pmax(a, b), 
+  Pmax(a, b)
+)
+```
+
+### Sort:
+```{r}
+set.seed(3)
+x = runif(1e6)
+```
+
+```{r}
+bench::mark(
+  sort(x),
+  Sort(x)
+)
+```
+
+### Generate random matrix:
+```{r}
+bench::mark(
+  matrix(rnorm(1e7), 1e5, 1e2), 
+  matrnorm(1e5, 1e2), 
+  rmvnorm(1e5, rep(0, 1e2), diag(1e2)),
+  check = FALSE
+)
+```
+
+### Row Sums
+```{r}
+X = matrnorm(1e5, 1e2, seed = 1)
+bench::mark(
+  rowSums(X), 
+  rowsums(X)
+)
+```
+
+### Column Means
+You may be surprised to see that this fails!
+```{r}
+# try() used to prevent this from holding up document knitting
+try(bench::mark(
+  colMeans(X),
+  colmeans(X)
+))
+```
+What is the actual discrepancy:
+```{r}
+unname(colMeans(X) - colmeans(X))
+```
+Skip the check:
+```{r}
+bench::mark(
+  colMeans(X), 
+  colmeans(X), 
+  check = FALSE,
+  min_iterations = 5
+)
+```
+
+Interesting observation:
+```{r}
+M = as.matrix(
+  c(10^10, 10^-10, -10^10)
+)
+base::colSums(M)
+Rfast::colsums(M)
+```
+
+### Generating sorted uniform distribution:
+
+Here, we can see the effects of
+a) optimizing from a programming perspective, and/or
+b) optimizing from a domain knowledge perspective
+
+```{r}
+n = 1e7
+# install.packages("dqrng") # Fast C++ random number generation
+bench::mark(
+  sort(runif(n)),          # Naive, slow sort, slow RNG
+  Sort(runif(n)),          # Naive, fast sort, slow RNG
+  sort(dqrng::dqrunif(n)), # Naive, slow sort, fast RNG
+  Sort(dqrng::dqrunif(n)), # Naive, fast sort, fast RNG
+  head(prop.table(cumsum(rexp(n + 1))), -1),          # Smart, no sort, slow RNG
+  head(prop.table(cumsum(dqrng::dqrexp(n + 1))), -1), # Smart, no sort, fast RNG
+  check = FALSE,
+  min_iterations = 5
+)
+```
+
+Source: https://stats.stackexchange.com/questions/134241/how-to-generate-sorted-uniformly-distributed-values-in-an-interval-efficiently
+
+NB: There may be numerical round-off issues here, which may or may not be acceptable for a use-case.
+
+# Exploring Overhead
+
+## Sorted uniform distribution
+
+One parameter to vary (n), but we want multiple replicates:
+
+```{r}
+sorted.uniform = bench::press(
+  n = c(3, 7, 11),
+  p = c(3, 5, 7), 
+  rep = 1:5,
+  {
+    bench::mark(
+      matrix(rnorm(n * p), n, p),
+      matrnorm(n, p),
+      check = FALSE
+    )
+  }
+)
+```
+
+```{r}
+library(ggplot2)
+ggplot(sorted.uniform, 
+       aes(x = n, y = median,
+           group = as.character(expression),
+           colour = as.character(expression))) + 
+  geom_point() + geom_smooth(se = FALSE) + 
+  scale_x_log10() + facet_grid(paste0("p = ", p) ~ .)
+```
+
+
+# Example: Finite Gaussian mixture models via EM algorithm
+
+Define initial parameters and dataset:
+```{r}
+# pars is a list with elements:
+#   G: number of components
+#   pi: marginal component probabilities
+#   mu: a list of mean vectors
+#   sigma: a list of covariance matrices
+
+init.par = list(
+  G = 3,
+  pi = c(1/3, 1/3, 1/3),
+  mu = list(c(5, 3, 1, 0, rep(1, 6)),
+            c(6, 3, 4, 1, rep(1, 6)),
+            c(7, 3, 6, 2, rep(1, 6))),
+  sigma = rep(list(diag(10)), 3)
+)
+
+# Replicate the iris dataset with jitter to make it a bit bigger
+jittered.iris = replicate(10,
+                          as.matrix(iris[-5]) + 0.1 * matrnorm(150, 4),
+                          simplify = FALSE)
+jittered.iris = do.call(rbind, jittered.iris)
+# Add 6 columns of unrelated noise
+jittered.iris = cbind(jittered.iris, matrnorm(nrow(jittered.iris), 6))
+```
+
+Define the 'naive' set of helper functions
+```{r}
+# Adapted from Rfast::dmvnorm
+my.dmvnorm = function(x, mu, sigma, log = TRUE) {
+  quat = -mahalanobis(x, mu, sigma) / 2
+  pow = length(mu) / 2
+  logcon = pow * log(2*pi) + log(det(sigma)) / 2
+  return(if (log) quat - logcon else exp(quat - logcon))
+}
+
+e.step = function(data, pars) {
+  z = matrix(0, nrow(data), pars$G)
+  for (g in 1:pars$G) {
+    z[, g] = log(pars$pi[g]) + my.dmvnorm(data, pars$mu[[g]], pars$sigma[[g]], log = TRUE)
+  }
+  max.z = z[cbind(1:nrow(data), max.col(z))]
+  z = z - max.z
+  z = exp(z)
+  z = z / rowSums(z)
+  return(z)
+}
+
+m.step = function(z, data, pars) {
+  pars$pi = colMeans(z)
+  for (g in 1:pars$G) {
+    wt = z[,g] / sum(z[,g])
+    pars$mu[[g]] = colSums(data * wt)
+    pars$sigma[[g]] = cov.wt(data, wt, center = pars$mu[[g]], method = "ML")$cov
+  }
+  return(pars)
+}
+
+log.lik = function(data, pars) {
+  z = matrix(0, nrow(data), pars$G)
+  for (g in 1:pars$G) {
+    z[, g] = pars$pi[g] * my.dmvnorm(data, pars$mu[[g]], pars$sigma[[g]], log = FALSE)
+  }
+  return(sum(log(rowSums(z))))
+}
+
+em.step = function(data, pars, iters) {
+  log.lik = NA * numeric(iters)
+  for (i in 1:iters) {
+    z = e.step(data, pars)
+    pars = m.step(z, data, pars)
+    log.lik[i] = log.lik(data, pars)
+  }
+  pars$log.lik = log.lik
+  return(pars)
+}
+
+fit = em.step(jittered.iris, init.par, 1000)
+plot(fit$log.lik, type = 'l', xlab = "Iteration", ylab = "Log-Likelihood")
+```
+
+# Rcpp Integration
+
+## How to use
+
+There are a few ways to define a C++ function via Rcpp.
+
+First is `cppFunction()` as foreshadowed by the start of this document.
+This is often the most convenience since you do not need some of the 
+boilerplate C++ code.
+
+```{r}
+cppFunction("
+  NumericVector square_me_1(NumericVector x) {
+    NumericVector y = x * x;
+    return y;
+  }
+")
+```
+
+Second is `sourceCpp()` which is mainly used to source a `.cpp` external file, 
+but can also be passed the code inline with the `code = ` parameter.
+
+```{r}
+sourceCpp(code = "
+  #include \"Rcpp.h\"
+  using namespace Rcpp;
+  
+  // [[Rcpp::export]]
+  NumericVector square_me_2(NumericVector x) {
+    NumericVector y = x * x;
+    return y;
+  }
+")
+```
+
+Third is exclusive to R Markdown documents, and that is the `Rcpp` code chunk.
+This behaves like `sourceCpp()` but is easier to use in R Markdown since it
+provides full syntax highlighting and autocomplete. 
+
+```{Rcpp}
+#include "Rcpp.h"
+using namespace Rcpp;
+
+// [[Rcpp::export]]
+NumericVector square_me_3(NumericVector x) {
+  NumericVector y = x * x;
+  return y;
+}
+```
+
+These all yield functions that can be called from R:
+
+```{r}
+square_me_1(1:10)
+square_me_2(1:10)
+square_me_3(1:10)
+```
+
+## Effectiveness
+
+Here are some replacements for the mixture model example helper functions.
+Because the inputs and outputs are matched, they are truly drop-in replacements.
+If you do not know C++, feel free to ignore the contents, and just know that
+`e_step_cpp` does the same job as `e.step`, and so forth.
+
+```{Rcpp}
+// [[Rcpp::depends(RcppArmadillo)]]
+#include "RcppArmadillo.h"
+using namespace Rcpp;
+using namespace arma;
+
+// [[Rcpp::export]]
+vec mahalanobis_cpp(const mat & x, const vec & mu, const mat & sigma) {
+  mat x_center = x.each_row() - mu.t();
+  mat cholsigma = chol(sigma, "lower");
+  mat backsolve = solve(trimatl(cholsigma), x_center.t());
+  vec result = sum(square(backsolve), 0).t();
+  return result;
+}
+
+// [[Rcpp::export]]
+vec dmvnorm_cpp(const mat & x, const vec & mu, const mat & sigma, bool log = true) {
+  vec quat = -mahalanobis_cpp(x, mu, sigma) / 2.0;
+  double pow = mu.n_elem / 2.0;
+  // Hard-coded the log(2pi) constant
+  double logcon = pow * 1.837877066409345339082 + log_det_sympd(sigma) / 2.0;
+  if (log) {return quat - logcon;} else {return exp(quat - logcon);}
+}
+
+// [[Rcpp::export]]
+mat e_step_cpp(const mat & data, const List & pars) {
+  unsigned int G = pars["G"];
+  mat z(data.n_rows, G);
+  vec pi = pars["pi"];
+  List mu = pars["mu"];
+  List sigma = pars["sigma"];
+  
+  for (unsigned int g = 0; g < G; g++) {
+    z.col(g) = log(pi(g)) + dmvnorm_cpp(data, mu[g], sigma[g], true);
+  }
+  vec max_z = max(z, 1);
+  z.each_col() -= max_z;
+  z = exp(z);
+  z.each_col() /= sum(z, 1);
+  return z;
+}
+
+// [[Rcpp::export]]
+mat weighted_cov(mat X, const vec & w, const vec & mu) {
+  X.each_row() -= mu.t();
+  X.each_col() %= sqrt(w);
+  mat result = X.t() * X;
+  return result;
+}
+
+// [[Rcpp::export]]
+List m_step_cpp(const mat & z, const mat & data, List pars) {
+  unsigned int G = pars["G"];
+  List mu = pars["mu"];
+  List sigma = pars["sigma"];
+  
+  pars["pi"] = mean(z, 0).t();
+  for (unsigned int g = 0; g < G; g++) {
+    vec wt = z.col(g) / accu(z.col(g));
+    vec mu_g = data.t() * wt;
+    mu[g] = mu_g;
+    sigma[g] = weighted_cov(data, wt, mu_g);
+  }
+  pars["mu"] = mu;
+  pars["sigma"] = sigma;
+  return pars;
+}
+
+// [[Rcpp::export]]
+double log_lik_cpp(const mat & data, const List & pars) {
+  unsigned int G = pars["G"];
+  mat z(data.n_rows, G);
+  vec pi = pars["pi"];
+  List mu = pars["mu"];
+  List sigma = pars["sigma"];
+  
+  for (unsigned int g = 0; g < G; g++) {
+    z.col(g) = pi(g) * dmvnorm_cpp(data, mu[g], sigma[g], false);
+  }
+  return accu(log(sum(z, 1)));
+}
+
+// [[Rcpp::export]] 
+List em_step_cpp(const mat & data, List pars, const unsigned int iters) {
+  NumericVector log_lik(iters, NA_REAL);
+  for (unsigned int i = 0; i < iters; i++) {
+    mat z = e_step_cpp(data, pars);
+    pars = m_step_cpp(z, data, pars);
+    log_lik(i) = log_lik_cpp(data, pars);    
+  }
+  pars["log.lik"] = log_lik;
+  return pars;
+}
+```
+
+Duplicate the helper function chunk from above, and try incrementally
+substituting in the C++ variants of functions and benchmarking/profiling
+along the way. It may help to add a suffix `.2` here to distinguish your
+functions from the original set. This will also help you compare the numerical
+results and make sure you get the same output for the same input.
+
+```{r}
+# Copy paste in the my.dmvnorm, e.step, m.step, log.lik, em.step functions
+```

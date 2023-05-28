@@ -1,0 +1,246 @@
+---
+title: "SSC 2023 - High Performance R"
+subtitle: "Session 1"
+author: "Jason Hou-Liu"
+output: pdf_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Welcome!
+
+This is the sidecar file for the first session of High Performance R at SSC 2023 in Ottawa. You will find examples and code here to run during and between presentations. This document is designed for interactive usage, but can also be knitted to whichever format you like. 
+
+# Pre-Requisites and Setup
+
+Check for and install missing packages:
+
+```{r}
+pkgs = c("Rcpp", "RcppArmadillo", "Rfast", "Rfast2", "pbapply", "profvis", "bench")
+missing.pkgs = setdiff(pkgs, rownames(installed.packages()))
+if (length(missing.pkgs) > 0) install.packages(missing.pkgs)
+```
+
+Try loading all of the packages:
+
+```{r}
+success = suppressMessages(sapply(pkgs, require, character.only = TRUE, quietly = TRUE))
+if (all(success)) message("Successfully loaded all packages!") else stop("Failed to load ", paste0(pkgs[!success], collapse = ", "))
+```
+
+Try compiling an RcppArmadillo function to make sure Rtools or Xcode is working:
+
+```{r}
+cppFunction("
+  arma::mat arma_crossprod(arma::mat X, arma::mat Y) {
+    arma::mat result = X.t() * Y;
+    return result;
+  }
+", depends = "RcppArmadillo")
+
+X = Y = as.matrix(iris[-5])
+crossprod(X, Y)
+arma_crossprod(X, Y)
+```
+
+## Troubleshooting
+
+If the above doesn't work, verify this:
+
+```{r}
+Sys.which("make") # This should be non-empty!
+```
+
+1. On Windows, make sure your Rtools version matches your R major version (4.1, 4.2, 4.3). Try re-running the Rtools installer as administrator as well.
+2. On Mac, try the instructions on this webpage: https://thecoatlessprofessor.com/programming/cpp/r-compiler-tools-for-rcpp-on-macos/
+
+
+# General Guidance
+
+Try using RStudio's Extract Function tool on the following code:
+
+```{r}
+n <- 100
+p <- 5
+X <- matrix(rnorm(n*p), n, p)
+y <- c(X %*% runif(p))
+lam <- seq(0, 1, length.out = 100)
+
+beta <- list()
+for (i in seq_along(lam)) {
+  XTX <- crossprod(X) + lam[i] * diag(p)
+  XTy <- crossprod(X, y)
+  beta <- solve(XTX, XTy)
+}
+```
+
+# Benchmarking
+
+Setup:
+```{r}
+set.seed(1)
+p = 2000
+X = rWishart(1, p, diag(p))[,,1]
+```
+
+Using `system.time`:
+
+```{r}
+(time1 <- system.time(eigen(X)))
+(time2 <- system.time(eigen(X, only.values = TRUE)))
+```
+
+Using `proc.time`:
+
+```{r}
+time1 <- proc.time()[["elapsed"]]
+e1 <- eigen(X)
+time1b <- proc.time()[["elapsed"]]
+time1b - time1
+
+time2 <- proc.time()[["elapsed"]]
+e2 <- eigen(X, only.values = TRUE)
+time2b <- proc.time()[["elapsed"]]
+time2b - time2
+```
+
+Using the `tictoc` package:
+
+```{r}
+library(tictoc)
+
+tic()
+e1 = eigen(X)
+toc()
+
+tic()
+e2 = eigen(X, only.values = TRUE)
+toc()
+```
+
+Using the `microbenchmark` package:
+
+```{r}
+library(microbenchmark)
+
+microbenchmark(
+  e1 = eigen(X),
+  e2 = eigen(X, only.values = TRUE),
+  times = 10
+)
+```
+
+Trying to force garbage collection on a small matrix:
+```{r}
+microbenchmark(
+  e1 = eigen(X[1:50, 1:50]),
+  e2 = eigen(X[1:50, 1:50], only.values = TRUE),
+  times = 1000
+)
+```
+
+Using the `bench` package:
+
+```{r}
+bench::mark(
+  e1 = eigen(X[1:50, 1:50]),
+  e2 = eigen(X[1:50, 1:50], only.values = TRUE),
+  min_time = 10,
+  check = FALSE
+)
+```
+
+# Profiling
+
+Code to profile; we will use logistic regression with iteratively re-weighted least squares (IRLS) as our example.
+
+```{r}
+# Generate the data
+set.seed(1)
+n = 100000
+d = 10
+true.beta = rnorm(d)
+X = cbind(1, matrix(rnorm(n * (d - 1)), n, d - 1))
+p = as.numeric(plogis(X %*% true.beta))
+y = runif(n) <= p
+```
+
+```{r}
+# Define the IRLS function
+logistic.irls = function(X, y, beta = rep(0, ncol(X)), iters) {
+  for (i in 1:iters) {
+    p = as.numeric(plogis(X %*% beta))
+    hessian = t(X) %*% (X * (p * (1 - p)))
+    gradient = t(X) %*% (y - p)
+    beta = beta + solve(hessian, gradient)
+  }
+  return(beta)
+}
+
+# Profile this function
+logistic.irls(X, y, iters = 100)
+```
+
+Use the slightly more optimal `crossprod`:
+```{r}
+# Define a slightly more optimal function
+logistic.irls.2 = function(X, y, beta = rep(0, ncol(X)), iters) {
+  for (i in 1:iters) {
+    p = as.numeric(plogis(X %*% beta))
+    hessian = crossprod(X, X * (p * (1 - p)))
+    gradient = crossprod(X, y - p)
+    beta = beta + solve(hessian, gradient)
+  }
+  return(beta)
+}
+
+# Profile this function
+logistic.irls.2(X, y, iters = 100)
+```
+
+Use `bench::mark`:
+```{r}
+bench::mark(
+  original = logistic.irls(X, y, iters = 100),
+  crossprod = logistic.irls.2(X, y, iters = 100),
+  filter_gc = FALSE,
+  min_iterations = 5
+)
+```
+
+Hands-on practice:
+```{r}
+# Try making this function even faster!
+logistic.irls.3 = function(X, y, beta = rep(0, ncol(X)), iters) {
+  for (i in 1:iters) {
+    p = as.numeric(plogis(X %*% beta))
+    hessian = crossprod(X, X * (p * (1 - p)))
+    gradient = crossprod(X, y - p)
+    beta = beta + solve(hessian, gradient)
+  }
+  return(beta)
+}
+
+# Profile this function
+logistic.irls.3(X, y, iters = 100)
+```
+
+R's built-in glm function (or glm.fit in this case), with a slight modification to remove convergence check:
+```{r}
+# Copy the function from stats::
+glm.fit.no.check = stats::glm.fit
+# Remove the call to glm.control (which validates epsilon > 0)
+body(glm.fit.no.check)[[2]] = substitute(control <- control)
+
+# Use this function to force 100 iterations; a convergence warning will
+# always be issued now since it will never pass the convergence check.
+R.fit = suppressWarnings(glm.fit.no.check(X, y, family = binomial(),
+                                          control = list(epsilon = 0, 
+                                                         maxit = 100, 
+                                                         trace = FALSE)))
+```
+
+If you look inside `glm.fit` by running `View(glm.fit)`, you will see lots of code to handle all of the glm family models, as well as edge case handling. The majority of the function's time is spent out at a C function called `C_Cdqrls`, which effectively does the heavy lifting of computing the OLS estimate $(X^\top X)^{-1} (X^\top y)$.
